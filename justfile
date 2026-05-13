@@ -46,10 +46,6 @@ tidy:
 compare-claude-p: build
     scripts/compare-claude-p.sh
 
-# Build release binaries into dist/
-dist: clean
-    mkdir -p dist
-    GOOS=linux GOARCH=amd64 go build -o dist/agentrun-linux-amd64 ./cmd/agentrun
-    GOOS=linux GOARCH=arm64 go build -o dist/agentrun-linux-arm64 ./cmd/agentrun
-    GOOS=darwin GOARCH=amd64 go build -o dist/agentrun-darwin-amd64 ./cmd/agentrun
-    GOOS=darwin GOARCH=arm64 go build -o dist/agentrun-darwin-arm64 ./cmd/agentrun
+# Build release archives into dist/
+dist:
+    scripts/build-release.sh
