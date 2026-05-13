@@ -43,6 +43,21 @@ Run opt-in comparison checks against real `claude -p` behavior. This uses Claude
 just compare-claude-p
 ```
 
+Build cross-platform release archives locally:
+
+```bash
+just dist
+```
+
+## Releases
+
+CI runs on every push and pull request. Pushing a tag that starts with `v` builds Linux and macOS artifacts for amd64/arm64, generates `checksums.txt`, and publishes a GitHub release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Drop-in `claude -p` compatibility
 
 For the easiest migration, replace only the binary name:
