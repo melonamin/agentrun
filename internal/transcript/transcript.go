@@ -184,8 +184,8 @@ func WaitTurn(ctx context.Context, transcript string, offset int64, cwd string, 
 }
 
 func locateTranscript(ctx context.Context, cwd string, started time.Time, timeout time.Duration, prompt string) (string, error) {
-	deadline := time.Now().Add(timeout)
 	if prompt != "" {
+		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
 			p, err := FindChangedForPrompt(started, cwd, prompt)
 			if err == nil {
@@ -198,6 +198,7 @@ func locateTranscript(ctx context.Context, cwd string, started time.Time, timeou
 			}
 		}
 	}
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		p, err := FindChanged(started, cwd)
 		if err == nil {

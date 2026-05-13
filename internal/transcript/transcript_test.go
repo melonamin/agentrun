@@ -256,3 +256,28 @@ func TestFindChangedForPromptMatchesUserPrompt(t *testing.T) {
 		t.Fatalf("got %s want %s", got, newPath)
 	}
 }
+
+func TestLocateTranscriptFallsBackWhenPromptDoesNotMatch(t *testing.T) {
+	root := t.TempDir()
+	cwd := t.TempDir()
+	t.Setenv("AGENTRUN_CLAUDE_DIR", root)
+	dir := filepath.Join(root, "projects", encodeClaudeProjectPath(cwd))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"user","message":{"content":"stored prompt differs"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now().Add(-time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := locateTranscript(ctx, cwd, started, 10*time.Millisecond, "original prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != path {
+		t.Fatalf("got %s want %s", got, path)
+	}
+}

@@ -113,7 +113,7 @@ func (c Client) SendText(name, text string) error {
 	parts := strings.Split(text, "\n")
 	for i, part := range parts {
 		if part != "" {
-			if err := c.run("send-keys", "-t", name, "-l", part); err != nil {
+			if err := c.run("send-keys", "-t", name, "-l", "--", part); err != nil {
 				return err
 			}
 		}
