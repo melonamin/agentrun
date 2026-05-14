@@ -1,8 +1,10 @@
 package transcript
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,6 +162,102 @@ func TestStreamTurnExitsOnResultEvent(t *testing.T) {
 	if !strings.Contains(buf.String(), `"result":"done"`) {
 		t.Fatalf("expected result event emitted, got: %s", buf.String())
 	}
+}
+
+func TestStreamTurnCompatEmitsContentDeltasAndFinalResultText(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	contents := `{"type":"assistant","message":{"content":[{"type":"text","text":"done <<<RALPHEX:ALL_TASKS_DONE>>>"}],"stop_reason":"end_turn"}}
+{"type":"result","result":"done <<<RALPHEX:ALL_TASKS_DONE>>>"}
+`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var buf bytes.Buffer
+	res, err := StreamTurn(ctx, &buf, path, 0, "", time.Now(), 10*time.Second, "", StreamOptions{Compat: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `"type":"content_block_delta"`) || !strings.Contains(out, `"type":"text_delta"`) {
+		t.Fatalf("expected content delta, got: %s", out)
+	}
+	if !strings.Contains(out, `<<<RALPHEX:ALL_TASKS_DONE>>>`) {
+		t.Fatalf("expected signal text, got: %s", out)
+	}
+	if strings.Contains(out, `"type":"assistant"`) {
+		t.Fatalf("did not expect raw assistant event in compat output: %s", out)
+	}
+	if !strings.Contains(res.Text, "<<<RALPHEX:ALL_TASKS_DONE>>>") {
+		t.Fatalf("expected signal in result text: %q", res.Text)
+	}
+	parsed := parseRalphexFixtureText(t, out)
+	if !strings.Contains(parsed, "<<<RALPHEX:ALL_TASKS_DONE>>>") {
+		t.Fatalf("ralphex-like parser did not see signal in %q", parsed)
+	}
+}
+
+func TestWriteContentDeltaEscapesLargeSignalText(t *testing.T) {
+	var buf bytes.Buffer
+	text := strings.Repeat("x", 128*1024) + "\n<<<RALPHEX:REVIEW_DONE>>>"
+	if err := writeContentDelta(&buf, text); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `<<<RALPHEX:REVIEW_DONE>>>`) {
+		t.Fatalf("signal missing from encoded delta")
+	}
+	if !json.Valid(buf.Bytes()) {
+		t.Fatalf("invalid JSON: %s", buf.String()[:80])
+	}
+}
+
+func parseRalphexFixtureText(t *testing.T, stream string) string {
+	t.Helper()
+	var out strings.Builder
+	scanner := bufio.NewScanner(strings.NewReader(stream))
+	for scanner.Scan() {
+		var ev struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+			Message struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+			Result json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+			continue
+		}
+		switch ev.Type {
+		case "content_block_delta":
+			if ev.Delta.Type == "text_delta" {
+				out.WriteString(ev.Delta.Text)
+			}
+		case "assistant", "message_stop":
+			for _, c := range ev.Message.Content {
+				if c.Type == "text" {
+					out.WriteString(c.Text)
+				}
+			}
+		case "result":
+			var obj struct {
+				Output string `json:"output"`
+			}
+			if err := json.Unmarshal(ev.Result, &obj); err == nil {
+				out.WriteString(obj.Output)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out.String()
 }
 
 func TestReadLinesSinceHoldsPartialLine(t *testing.T) {

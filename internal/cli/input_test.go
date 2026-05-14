@@ -25,6 +25,17 @@ func TestReadTextPromptStdin(t *testing.T) {
 	}
 }
 
+func TestReadTextPromptLargeStdin(t *testing.T) {
+	want := strings.Repeat("ralphex prompt\n", 512*1024)
+	got, err := readTextPrompt(nil, strings.NewReader(want+"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != strings.TrimRight(want, "\r\n") {
+		t.Fatalf("large prompt length got %d want %d", len(got), len(strings.TrimRight(want, "\r\n")))
+	}
+}
+
 func TestReadStreamMessages(t *testing.T) {
 	in := strings.NewReader(`{"type":"user","message":{"role":"user","content":"hello"}}
 {"type":"assistant","message":{"content":"ignored"}}

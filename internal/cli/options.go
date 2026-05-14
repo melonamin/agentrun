@@ -20,6 +20,7 @@ type promptOptions struct {
 	CWD                    string
 	Last                   bool
 	Detach                 bool
+	PersistSession         bool
 	PrintCompat            bool
 	Quiet                  bool
 	NoSessionPersistence   bool
@@ -27,6 +28,7 @@ type promptOptions struct {
 	IncludeHookEvents      bool
 	ReplayUserMessages     bool
 	OutputFormat           string
+	OutputFormatExplicit   bool
 	InputFormat            string
 	IdleTimeout            time.Duration
 	TurnTimeout            time.Duration
@@ -90,15 +92,22 @@ func parsePromptArgs(argv []string, cwd string) (promptOptions, error) {
 			i = ni
 		case "-d", "--detach":
 			opts.Detach = true
+			opts.PersistSession = true
+		case "--persist-session":
+			opts.PersistSession = true
 		case "--stream":
 			opts.OutputFormat = formatStreamJSON
+			opts.OutputFormatExplicit = true
 		case "--text":
 			opts.OutputFormat = formatText
+			opts.OutputFormatExplicit = true
 		case "-q", "--quiet":
 			opts.Quiet = true
 			opts.OutputFormat = formatText
+			opts.OutputFormatExplicit = true
 		case "--json":
 			opts.OutputFormat = formatJSON
+			opts.OutputFormatExplicit = true
 		case "--idle-timeout":
 			v, ni, err := flagValue(name, val, hasVal, argv, i)
 			if err != nil {
@@ -127,6 +136,7 @@ func parsePromptArgs(argv []string, cwd string) (promptOptions, error) {
 				return opts, err
 			}
 			opts.OutputFormat = v
+			opts.OutputFormatExplicit = true
 			i = ni
 		case "--input-format":
 			v, ni, err := flagValue(name, val, hasVal, argv, i)
@@ -173,6 +183,10 @@ func validateFormats(opts promptOptions) error {
 		return claudeStyleError(fmt.Sprintf("error: option '--input-format <format>' argument '%s' is invalid. Allowed choices are text, stream-json.", opts.InputFormat))
 	}
 	return nil
+}
+
+func (opts promptOptions) UsesTmuxSession() bool {
+	return opts.PersistSession || opts.SessionID != "" || opts.Last || opts.Detach
 }
 
 func splitFlag(arg string) (name, val string, hasVal bool) {
@@ -246,5 +260,5 @@ func collectClaudeArg(name, val string, hasVal bool, argv []string, i int) ([]st
 		}
 		return []string{name}, i, nil
 	}
-	return nil, i, claudeStyleError(fmt.Sprintf("error: unknown option '%s'", name))
+	return []string{name}, i, nil
 }

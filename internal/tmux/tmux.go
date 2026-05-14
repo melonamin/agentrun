@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -19,6 +20,7 @@ const (
 	// WaitReady tolerates before giving up, so a session that died mid-startup
 	// surfaces immediately instead of after the full timeout.
 	maxCapturePaneErrors = 5
+	sendKeysChunkSize    = 8192
 )
 
 // readyGlyphs are part of Claude Code's persistent input-box chrome.
@@ -113,8 +115,10 @@ func (c Client) SendText(name, text string) error {
 	parts := strings.Split(text, "\n")
 	for i, part := range parts {
 		if part != "" {
-			if err := c.run("send-keys", "-t", name, "-l", "--", part); err != nil {
-				return err
+			for _, chunk := range chunkString(part, sendKeysChunkSize) {
+				if err := c.run("send-keys", "-t", name, "-l", "--", chunk); err != nil {
+					return err
+				}
 			}
 		}
 		if i < len(parts)-1 {
@@ -125,6 +129,28 @@ func (c Client) SendText(name, text string) error {
 	}
 	time.Sleep(sendKeysSettleDelay)
 	return c.run("send-keys", "-t", name, "Enter")
+}
+
+func chunkString(s string, maxBytes int) []string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return []string{s}
+	}
+	var chunks []string
+	for len(s) > maxBytes {
+		cut := maxBytes
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		if cut == 0 {
+			cut = maxBytes
+		}
+		chunks = append(chunks, s[:cut])
+		s = s[cut:]
+	}
+	if s != "" {
+		chunks = append(chunks, s)
+	}
+	return chunks
 }
 
 func (c Client) Status(name string) string {

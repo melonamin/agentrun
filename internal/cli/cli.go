@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/melonamin/agentrun/internal/session"
@@ -32,6 +35,7 @@ var helpIncludePartial bool
 var helpIncludeHooks bool
 var helpReplayUser bool
 var helpNoPersistence bool
+var helpPersistSession bool
 
 func Execute() {
 	args := os.Args[1:]
@@ -66,6 +70,56 @@ func printCLIError(err error) {
 	fmt.Fprintln(os.Stderr, "agentrun:", err)
 }
 
+type cleanupManager struct {
+	mu   sync.Mutex
+	once sync.Once
+	fn   func()
+}
+
+func (c *cleanupManager) Set(fn func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fn = fn
+}
+
+func (c *cleanupManager) Empty() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fn == nil
+}
+
+func (c *cleanupManager) Run() {
+	c.once.Do(func() {
+		c.mu.Lock()
+		fn := c.fn
+		c.mu.Unlock()
+		if fn != nil {
+			fn()
+		}
+	})
+}
+
+func cleanupSignalContext(cleanup *cleanupManager) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 2)
+	done := make(chan struct{})
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-signals:
+			cancel()
+			cleanup.Run()
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(signals)
+		close(done)
+		cancel()
+	}
+}
+
 func shouldUseCobra(args []string) bool {
 	// Empty args deliberately fall through to the manual path so a TTY invocation
 	// prints help instead of cobra's RunE blocking on os.Stdin.
@@ -84,7 +138,7 @@ func root() *cobra.Command {
 	o.cwd, _ = os.Getwd()
 	o.idle = 2 * time.Second
 	o.timeout = 30 * time.Minute
-	cmd := &cobra.Command{Use: "agentrun [prompt]", Short: "Non-interactive CLI for interactive Claude Code sessions", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "agentrun [prompt]", Short: "Claude print-compatible CLI with optional persistent sessions", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, _ := os.Getwd()
 		opts, err := parsePromptArgs(os.Args[1:], cwd)
 		if err != nil {
@@ -110,16 +164,24 @@ func addFlags(c *cobra.Command) {
 	f.BoolVar(&helpIncludeHooks, "include-hook-events", false, "accept Claude -p hook-event streaming flag")
 	f.BoolVar(&helpReplayUser, "replay-user-messages", false, "echo stream-json user messages back to stdout")
 	f.BoolVar(&helpNoPersistence, "no-session-persistence", false, "remove the tmux-backed session after the turn")
-	f.BoolVar(&o.stream, "stream", false, "stream raw Claude JSONL transcript events until the turn completes")
+	f.BoolVar(&helpPersistSession, "persist-session", false, "use agentrun's tmux-backed persistent session mode")
+	f.BoolVar(&o.stream, "stream", false, "stream JSON output; raw transcript events in persistent mode")
 	f.BoolVar(&o.textOut, "text", false, "emit human-readable text instead of JSON")
 	f.BoolVarP(&o.quiet, "quiet", "q", false, "print assistant text only")
-	f.BoolVar(&jsonCompat, "json", false, "emit JSON (default; kept for compatibility)")
+	f.BoolVar(&jsonCompat, "json", false, "emit JSON (persistent default; kept for compatibility)")
 	_ = f.MarkHidden("json")
 	f.DurationVar(&o.idle, "idle-timeout", o.idle, "transcript stability duration used to detect turn completion")
 	f.DurationVar(&o.timeout, "turn-timeout", o.timeout, "maximum time to wait for a turn")
 }
 
 func runPromptOptions(opts promptOptions) error {
+	cleanup := &cleanupManager{}
+	ctx, stopSignals := cleanupSignalContext(cleanup)
+	defer stopSignals()
+	defer cleanup.Run()
+	if !opts.UsesTmuxSession() {
+		return runDirectPrint(ctx, opts)
+	}
 	if opts.InputFormat == inputStreamJSON {
 		messages, err := readStreamMessages(os.Stdin)
 		if err != nil {
@@ -128,16 +190,15 @@ func runPromptOptions(opts promptOptions) error {
 		if len(messages) == 0 {
 			return fmt.Errorf("--input-format stream-json requires user messages on stdin")
 		}
-		client, s, cleanup, err := prepareSession(opts)
+		client, s, err := prepareSession(opts, cleanup)
 		if err != nil {
 			return err
 		}
-		defer cleanup()
 		for _, msg := range messages {
 			if opts.ReplayUserMessages {
 				_ = replayMessage(os.Stdout, msg.Raw)
 			}
-			if err := runTurn(opts, client, s, msg.Text); err != nil {
+			if err := runTurn(ctx, opts, client, s, msg.Text); err != nil {
 				return err
 			}
 		}
@@ -150,22 +211,85 @@ func runPromptOptions(opts promptOptions) error {
 	if prompt == "" {
 		return fmt.Errorf("prompt is required")
 	}
-	client, s, cleanup, err := prepareSession(opts)
+	client, s, err := prepareSession(opts, cleanup)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
-	return runTurn(opts, client, s, prompt)
+	return runTurn(ctx, opts, client, s, prompt)
 }
 
-func prepareSession(opts promptOptions) (tmux.Client, *session.Session, func(), error) {
+func runDirectPrint(parent context.Context, opts promptOptions) error {
+	ctx, cancel := context.WithTimeout(parent, opts.TurnTimeout)
+	defer cancel()
+
+	args := directClaudeArgs(opts)
+	cmd := exec.Command("claude", args...)
+	cmd.Dir = opts.CWD
+	if len(opts.PromptArgs) == 0 {
+		cmd.Stdin = os.Stdin
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		killProcessGroup(cmd.Process.Pid)
+		err := <-done
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+}
+
+func directClaudeArgs(opts promptOptions) []string {
+	args := append([]string(nil), opts.ClaudeArgs...)
+	args = append(args, "--print")
+	if opts.OutputFormatExplicit {
+		args = append(args, "--output-format", opts.OutputFormat)
+	}
+	if opts.InputFormat != inputText {
+		args = append(args, "--input-format", opts.InputFormat)
+	}
+	if opts.IncludePartialMessages {
+		args = append(args, "--include-partial-messages")
+	}
+	if opts.IncludeHookEvents {
+		args = append(args, "--include-hook-events")
+	}
+	if opts.ReplayUserMessages {
+		args = append(args, "--replay-user-messages")
+	}
+	args = append(args, opts.PromptArgs...)
+	return args
+}
+
+func killProcessGroup(pid int) {
+	if pid <= 0 {
+		return
+	}
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err == nil {
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+func prepareSession(opts promptOptions, cleanup *cleanupManager) (tmux.Client, *session.Session, error) {
 	client := tmux.New()
-	cleanup := func() {}
 	var s *session.Session
 	if opts.Last || opts.SessionID != "" {
 		reg, err := session.Load()
 		if err != nil {
-			return client, nil, cleanup, err
+			return client, nil, err
 		}
 		if opts.Last {
 			s, err = reg.Last()
@@ -173,47 +297,50 @@ func prepareSession(opts promptOptions) (tmux.Client, *session.Session, func(), 
 			s, err = reg.Get(opts.SessionID)
 		}
 		if err != nil {
-			return client, nil, cleanup, err
+			return client, nil, err
 		}
 	}
 	if s != nil && len(opts.ClaudeArgs) > 0 {
-		return client, nil, cleanup, fmt.Errorf("Claude launch flags only apply when creating a new session; use a new session or omit them")
+		return client, nil, fmt.Errorf("Claude launch flags only apply when creating a new session; use a new session or omit them")
 	}
 	if s != nil && opts.NoSessionPersistence {
-		return client, nil, cleanup, fmt.Errorf("--no-session-persistence cannot be used with an existing session")
+		return client, nil, fmt.Errorf("--no-session-persistence cannot be used with an existing session")
 	}
 	created := false
 	if s == nil {
 		if _, err := exec.LookPath("tmux"); err != nil {
-			return client, nil, cleanup, fmt.Errorf("tmux not found in PATH")
+			return client, nil, fmt.Errorf("tmux not found in PATH")
 		}
 		if _, err := exec.LookPath("claude"); err != nil {
-			return client, nil, cleanup, fmt.Errorf("claude not found in PATH")
+			return client, nil, fmt.Errorf("claude not found in PATH")
 		}
 		now := time.Now()
 		ns := session.Session{Name: opts.Name, CreatedAt: now, UpdatedAt: now, CWD: opts.CWD, ClaudeArgs: append([]string(nil), opts.ClaudeArgs...)}
 		allocated, err := session.Allocate(ns)
 		if err != nil {
-			return client, nil, cleanup, err
+			return client, nil, err
 		}
 		allocated.Tmux = tmuxSessionName(allocated.ID)
 		if err := session.Update(allocated); err != nil {
 			_ = session.Remove(allocated.ID)
-			return client, nil, cleanup, err
+			return client, nil, err
 		}
 		if err := client.NewSession(allocated.Tmux, allocated.CWD, allocated.ClaudeArgs); err != nil {
 			_ = session.Remove(allocated.ID)
-			return client, nil, cleanup, err
+			return client, nil, err
 		}
 		s = &allocated
 		created = true
+		if opts.NoSessionPersistence {
+			cleanup.Set(func() { _ = client.Kill(allocated.Tmux); _ = session.Remove(allocated.ID) })
+		}
 		if resumeID := resumeSessionID(allocated.ClaudeArgs); resumeID != "" {
 			p := transcript.PathForSessionID(allocated.CWD, resumeID)
 			if transcript.Size(p) > 0 {
 				s.Transcript = p
 				s.LastOffset = transcript.Size(p)
 				if err := session.Update(*s); err != nil {
-					return client, nil, cleanup, err
+					return client, nil, err
 				}
 			}
 		}
@@ -228,10 +355,10 @@ func prepareSession(opts promptOptions) (tmux.Client, *session.Session, func(), 
 		}
 		time.Sleep(1 * time.Second)
 	}
-	if opts.NoSessionPersistence && created {
-		cleanup = func() { _ = client.Kill(s.Tmux); _ = session.Remove(s.ID) }
+	if opts.NoSessionPersistence && created && cleanup.Empty() {
+		cleanup.Set(func() { _ = client.Kill(s.Tmux); _ = session.Remove(s.ID) })
 	}
-	return client, s, cleanup, nil
+	return client, s, nil
 }
 
 func resumeSessionID(args []string) string {
@@ -258,7 +385,7 @@ func tmuxSessionName(id string) string {
 	return fmt.Sprintf("agentrun-%s-%x", id, sum[:4])
 }
 
-func runTurn(opts promptOptions, client tmux.Client, s *session.Session, prompt string) error {
+func runTurn(parent context.Context, opts promptOptions, client tmux.Client, s *session.Session, prompt string) error {
 	if !client.Has(s.Tmux) {
 		return fmt.Errorf("tmux session %s is not running", s.Tmux)
 	}
@@ -272,7 +399,7 @@ func runTurn(opts promptOptions, client tmux.Client, s *session.Session, prompt 
 	}
 	s.UpdatedAt = time.Now()
 	if opts.Detach {
-		ctx, cancel := context.WithTimeout(context.Background(), detachedTranscriptTimeout(opts.TurnTimeout))
+		ctx, cancel := context.WithTimeout(parent, detachedTranscriptTimeout(opts.TurnTimeout))
 		defer cancel()
 		if s.Transcript == "" {
 			if p, err := waitTranscriptPath(ctx, s.CWD, started, prompt); err == nil {
@@ -287,7 +414,7 @@ func runTurn(opts promptOptions, client tmux.Client, s *session.Session, prompt 
 		}
 		return printDetach(opts, *s)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), opts.TurnTimeout)
+	ctx, cancel := context.WithTimeout(parent, opts.TurnTimeout)
 	defer cancel()
 	if opts.OutputFormat == formatStreamJSON {
 		res, err := transcript.StreamTurn(ctx, os.Stdout, s.Transcript, offset, s.CWD, started, opts.IdleTimeout, prompt, transcript.StreamOptions{IncludeHookEvents: opts.IncludeHookEvents, IncludePartialMessages: opts.IncludePartialMessages, EmitUserEvents: !opts.PrintCompat, Compat: opts.PrintCompat})
@@ -350,7 +477,7 @@ func printDetach(opts promptOptions, s session.Session) error {
 		fmt.Println(s.ID)
 		return nil
 	}
-	return json.NewEncoder(os.Stdout).Encode(map[string]any{"session": s.ID, "status": "running", "tmux": s.Tmux, "cwd": s.CWD, "transcript": s.Transcript})
+	return encodeStdout(map[string]any{"session": s.ID, "status": "running", "tmux": s.Tmux, "cwd": s.CWD, "transcript": s.Transcript})
 }
 func printResult(opts promptOptions, s session.Session, r transcript.Result) error {
 	if opts.OutputFormat == formatText || opts.Quiet {
@@ -377,14 +504,14 @@ func printResult(opts promptOptions, s session.Session, r transcript.Result) err
 				"session": s.ID, "tmux": s.Tmux, "cwd": s.CWD, "transcript": r.Transcript, "events": r.Events, "no_session_persistence": opts.NoSessionPersistence,
 			},
 		}
-		return json.NewEncoder(os.Stdout).Encode(out)
+		return encodeStdout(out)
 	}
 	out := map[string]any{"session": s.ID, "status": "idle", "tmux": s.Tmux, "cwd": s.CWD, "transcript": r.Transcript, "result": map[string]any{"text": r.Text, "events": r.Events}}
 	if opts.NoSessionPersistence {
 		compat := map[string]any{"print": opts.PrintCompat, "no_session_persistence": opts.NoSessionPersistence}
 		out["compat"] = compat
 	}
-	return json.NewEncoder(os.Stdout).Encode(out)
+	return encodeStdout(out)
 }
 
 func printStreamResult(opts promptOptions, s session.Session, r transcript.Result) error {
@@ -400,7 +527,13 @@ func printStreamResult(opts promptOptions, s session.Session, r transcript.Resul
 		"permission_denials": []any{},
 		"agentrun":           map[string]any{"session": s.ID, "tmux": s.Tmux, "cwd": s.CWD, "transcript": r.Transcript, "events": r.Events},
 	}
-	return json.NewEncoder(os.Stdout).Encode(out)
+	return encodeStdout(out)
+}
+
+func encodeStdout(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetEscapeHTML(false)
+	return enc.Encode(v)
 }
 
 func listCmd() *cobra.Command {

@@ -256,6 +256,32 @@ func StreamTurn(ctx context.Context, w io.Writer, transcript string, offset int6
 			if parsed {
 				updatePendingTools(ev, pendingTools)
 			}
+			if parsed && opts.Compat {
+				typ, _ := ev["type"].(string)
+				if typ == "result" {
+					sawResult = true
+				}
+				texts := extractAssistantText(ev, opts.IncludePartialMessages)
+				if len(texts) > 0 {
+					if typ == "assistant" {
+						sawAssistant = true
+					}
+					parts = append(parts, texts...)
+					if typ == "assistant" || !sawAssistant {
+						for _, text := range texts {
+							if err := writeContentDelta(w, text); err != nil {
+								return Result{}, err
+							}
+							events++
+						}
+					}
+				}
+				if typ == "system" || (opts.IncludeHookEvents && isHookEvent(ev)) {
+					fmt.Fprintln(w, line)
+					events++
+				}
+				continue
+			}
 			if parsed && !ShouldEmitStreamEvent(ev, opts) {
 				continue
 			}
@@ -287,6 +313,18 @@ func StreamTurn(ctx context.Context, w io.Writer, transcript string, offset int6
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func writeContentDelta(w io.Writer, text string) error {
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	return enc.Encode(map[string]any{
+		"type": "content_block_delta",
+		"delta": map[string]any{
+			"type": "text_delta",
+			"text": text,
+		},
+	})
 }
 
 func ShouldEmitStreamEvent(ev Event, opts StreamOptions) bool {

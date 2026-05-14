@@ -42,6 +42,26 @@ func TestParseStreamAlias(t *testing.T) {
 	}
 }
 
+func TestParsePrintStreamDoesNotUseTmuxByDefault(t *testing.T) {
+	opts, err := parsePromptArgs([]string{"--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose", "--print"}, "/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.UsesTmuxSession() || !opts.PrintCompat || opts.OutputFormat != formatStreamJSON || !opts.OutputFormatExplicit {
+		t.Fatalf("unexpected opts: %#v", opts)
+	}
+}
+
+func TestParsePersistSessionOptIn(t *testing.T) {
+	opts, err := parsePromptArgs([]string{"--persist-session", "-p", "--output-format", "stream-json"}, "/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.UsesTmuxSession() || !opts.PersistSession || !opts.PrintCompat || opts.OutputFormat != formatStreamJSON {
+		t.Fatalf("unexpected opts: %#v", opts)
+	}
+}
+
 func TestParseRejectsInvalidOutput(t *testing.T) {
 	_, err := parsePromptArgs([]string{"-p", "--output-format", "yaml", "hello"}, "/repo")
 	if err == nil {
@@ -65,6 +85,50 @@ func TestParseCollectsPassthrough(t *testing.T) {
 	}
 	if !opts.IncludeHookEvents || opts.OutputFormat != formatStreamJSON {
 		t.Fatalf("unexpected opts %#v", opts)
+	}
+}
+
+func TestParseUnknownClaudeFlagIsTolerated(t *testing.T) {
+	opts, err := parsePromptArgs([]string{"-p", "--future-claude-flag", "--output-format", "stream-json"}, "/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opts.ClaudeArgs) != 1 || opts.ClaudeArgs[0] != "--future-claude-flag" {
+		t.Fatalf("claude args %#v", opts.ClaudeArgs)
+	}
+}
+
+func TestDirectClaudeArgsDefaultsToPrintWithoutOutputFormat(t *testing.T) {
+	opts, err := parsePromptArgs([]string{"hello"}, "/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := directClaudeArgs(opts)
+	want := []string{"--print", "hello"}
+	if len(got) != len(want) {
+		t.Fatalf("args %#v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("args %#v", got)
+		}
+	}
+}
+
+func TestDirectClaudeArgsPreservesRalphexShape(t *testing.T) {
+	opts, err := parsePromptArgs([]string{"--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose", "--print"}, "/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := directClaudeArgs(opts)
+	want := []string{"--dangerously-skip-permissions", "--verbose", "--print", "--output-format", "stream-json"}
+	if len(got) != len(want) {
+		t.Fatalf("args %#v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("args %#v", got)
+		}
 	}
 }
 
